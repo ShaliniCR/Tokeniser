@@ -2,7 +2,7 @@
 
 A React + TypeScript app that shows how many tokens a set of text samples uses, counted by Anthropic's official [Token Counting API](https://docs.anthropic.com/en/docs/build-with-claude/token-counting) (`POST /v1/messages/count_tokens`).
 
-**Live demo:** _add your deployed URL here_
+**Live demo:** https://tokeniser-gamma.vercel.app
 
 ## Features
 
