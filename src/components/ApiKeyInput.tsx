@@ -5,9 +5,14 @@ interface Props {
   onChange: (value: string) => void;
   error: string | null;
   disabled: boolean;
+  label: string;
+  placeholder: string;
+  apiHost: string;
+  consoleUrl: string;
+  consoleName: string;
 }
 
-export function ApiKeyInput({ value, onChange, error, disabled }: Props) {
+export function ApiKeyInput({ value, onChange, error, disabled, label, placeholder, apiHost, consoleUrl, consoleName }: Props) {
   const [visible, setVisible] = useState(false);
   const id = useId();
   const hintId = `${id}-hint`;
@@ -16,7 +21,7 @@ export function ApiKeyInput({ value, onChange, error, disabled }: Props) {
   return (
     <div className="field">
       <label htmlFor={id} className="field-label">
-        Anthropic API key
+        {label}
       </label>
       <div className="key-row">
         <input
@@ -25,7 +30,7 @@ export function ApiKeyInput({ value, onChange, error, disabled }: Props) {
           type={visible ? 'text' : 'password'}
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          placeholder="sk-ant-..."
+          placeholder={placeholder}
           autoComplete="off"
           autoCorrect="off"
           autoCapitalize="off"
@@ -63,8 +68,11 @@ export function ApiKeyInput({ value, onChange, error, disabled }: Props) {
         </p>
       )}
       <p id={hintId} className="field-hint">
-        Kept in memory only for this tab — never saved, logged, or sent anywhere except{' '}
-        <code>api.anthropic.com</code>. Reloading the page clears it.
+        Get a key from{' '}
+        <a href={consoleUrl} target="_blank" rel="noreferrer">
+          {consoleName}
+        </a>
+        . Stays in this tab’s memory only and is sent only to <code>{apiHost}</code>.
       </p>
     </div>
   );

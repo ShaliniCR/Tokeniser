@@ -1,4 +1,5 @@
 import type { TextSample } from '../data/samples';
+import type { ProviderId } from '../providers/types';
 
 export type SampleResult =
   | { status: 'idle' }
@@ -6,13 +7,20 @@ export type SampleResult =
   | { status: 'success'; tokens: number }
   | { status: 'error'; message: string };
 
+export interface ResultRow {
+  providerId: ProviderId;
+  providerName: string;
+  modelLabel: string;
+  result: SampleResult;
+}
+
 interface Props {
   sample: TextSample;
-  result: SampleResult;
+  rows: ResultRow[];
   onRemove?: () => void;
 }
 
-export function SampleCard({ sample, result, onRemove }: Props) {
+export function SampleCard({ sample, rows, onRemove }: Props) {
   const chars = [...sample.text].length;
 
   return (
@@ -28,7 +36,21 @@ export function SampleCard({ sample, result, onRemove }: Props) {
       </div>
       <pre className="sample-text">{sample.text}</pre>
       <div className="card-foot" aria-live="polite">
-        <TokenBadge result={result} />
+        {rows.length === 0 ? (
+          <span className="badge badge-idle">Add an API key to count</span>
+        ) : (
+          <ul className="result-rows">
+            {rows.map((row) => (
+              <li key={row.providerId} className="result-row">
+                <span className="result-provider" title={row.modelLabel}>
+                  <span className={`dot dot-${row.providerId}`} aria-hidden="true" />
+                  {row.providerName}
+                </span>
+                <TokenBadge result={row.result} />
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </li>
   );
@@ -37,7 +59,7 @@ export function SampleCard({ sample, result, onRemove }: Props) {
 function TokenBadge({ result }: { result: SampleResult }) {
   switch (result.status) {
     case 'idle':
-      return <span className="badge badge-idle">Not counted yet</span>;
+      return <span className="badge badge-idle">—</span>;
     case 'loading':
       return (
         <span className="badge badge-loading">

@@ -1,58 +1,224 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ApiKeyInput } from './components/ApiKeyInput';
-import { SampleCard, type SampleResult } from './components/SampleCard';
+import { SampleCard, type ResultRow, type SampleResult } from './components/SampleCard';
 import { PREDEFINED_SAMPLES, type TextSample } from './data/samples';
-import {
-  MODELS,
-  countTokens,
-  createClient,
-  toFriendlyError,
-  validateKeyShape,
-  type ModelId,
-} from './lib/tokenCounter';
+import { PROVIDERS } from './providers/registry';
+import type { ModelOption, ProviderId, ProviderMeta } from './providers/types';
 
-const CONCURRENCY = 3;
+const CONCURRENCY_PER_PROVIDER = 3;
 const MAX_CUSTOM_CHARS = 20_000;
 
-type Results = Record<string, SampleResult>;
+type PerProvider<T> = Record<ProviderId, T>;
+type Banner = { type: 'error' | 'success'; text: string } | null;
+/** results[sampleId][providerId] */
+type Results = Record<string, Partial<PerProvider<SampleResult>>>;
+
+function perProvider<T>(make: (p: ProviderMeta) => T): PerProvider<T> {
+  return Object.fromEntries(PROVIDERS.map((p) => [p.id, make(p)])) as PerProvider<T>;
+}
 
 export default function App() {
-  // The API key lives only in React state (memory). No storage, no logging.
-  const [apiKey, setApiKey] = useState('');
-  const [keyError, setKeyError] = useState<string | null>(null);
-  const [model, setModel] = useState<ModelId>(MODELS[0].id);
+  // API keys live only in React state (memory). No storage, no logging.
+  const [keys, setKeys] = useState(() => perProvider(() => ''));
+  const [keyErrors, setKeyErrors] = useState(() => perProvider<string | null>(() => null));
+  const [models, setModels] = useState(() => perProvider<ModelOption[]>((p) => p.defaultModels));
+  const [selected, setSelected] = useState(() => perProvider((p) => p.defaultModels[0].id));
+  const [loadingModels, setLoadingModels] = useState(() => perProvider(() => false));
+  const [banners, setBanners] = useState(() => perProvider<Banner>(() => null));
+  const [globalBanner, setGlobalBanner] = useState<Banner>(null);
   const [customSamples, setCustomSamples] = useState<TextSample[]>([]);
   const [draft, setDraft] = useState('');
   const [results, setResults] = useState<Results>({});
   const [running, setRunning] = useState(false);
-  const [banner, setBanner] = useState<{ type: 'error' | 'success'; text: string } | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
+  const runRef = useRef<AbortController | null>(null);
 
   const samples = useMemo(() => [...PREDEFINED_SAMPLES, ...customSamples], [customSamples]);
 
   // Cancel in-flight requests if the component unmounts.
-  useEffect(() => () => abortRef.current?.abort(), []);
+  useEffect(() => () => runRef.current?.abort(), []);
 
-  const total = useMemo(
+  /** Providers shown in results: those with a key entered, or with results already on screen. */
+  const shownProviders = PROVIDERS.filter(
+    (p) => keys[p.id].trim() || samples.some((s) => results[s.id]?.[p.id]),
+  );
+
+  const totals = useMemo(
     () =>
-      samples.reduce((sum, s) => {
-        const r = results[s.id];
-        return r?.status === 'success' ? sum + r.tokens : sum;
-      }, 0),
+      perProvider((p) => {
+        let tokens = 0;
+        let counted = 0;
+        for (const s of samples) {
+          const r = results[s.id]?.[p.id];
+          if (r?.status === 'success') {
+            tokens += r.tokens;
+            counted++;
+          }
+        }
+        return { tokens, counted };
+      }),
     [samples, results],
   );
-  const countedCount = samples.filter((s) => results[s.id]?.status === 'success').length;
 
-  function handleKeyChange(value: string) {
-    setApiKey(value);
-    if (keyError) setKeyError(null);
-    if (banner?.type === 'error') setBanner(null);
+  const modelLabel = (id: ProviderId) => models[id].find((m) => m.id === selected[id])?.label ?? selected[id];
+
+  function patch<T>(setter: React.Dispatch<React.SetStateAction<PerProvider<T>>>, id: ProviderId, value: NoInfer<T>) {
+    setter((prev) => ({ ...prev, [id]: value }));
   }
 
-  function handleModelChange(value: ModelId) {
-    setModel(value);
-    setResults({}); // counts are model-specific
-    setBanner(null);
+  function setResult(sampleId: string, id: ProviderId, r: SampleResult) {
+    setResults((prev) => ({ ...prev, [sampleId]: { ...prev[sampleId], [id]: r } }));
+  }
+
+  function clearProviderResults(id: ProviderId) {
+    setResults((prev) =>
+      Object.fromEntries(
+        Object.entries(prev).map(([sid, byProvider]) => {
+          const { [id]: _removed, ...rest } = byProvider;
+          return [sid, rest];
+        }),
+      ),
+    );
+  }
+
+  function handleKeyChange(id: ProviderId, value: string) {
+    patch(setKeys, id, value);
+    if (keyErrors[id]) patch(setKeyErrors, id, null);
+    if (banners[id]?.type === 'error') patch(setBanners, id, null);
+    if (globalBanner?.type === 'error') setGlobalBanner(null);
+  }
+
+  function handleModelChange(id: ProviderId, value: string) {
+    patch(setSelected, id, value);
+    clearProviderResults(id); // counts are model-specific
+    patch(setBanners, id, null);
+  }
+
+  function reportFatal(id: ProviderId, message: string) {
+    patch(setBanners, id, { type: 'error', text: message });
+    if (/api key/i.test(message)) patch(setKeyErrors, id, message);
+  }
+
+  async function handleLoadModels(p: ProviderMeta) {
+    const shapeError = p.validateKeyShape(keys[p.id]);
+    if (shapeError) {
+      patch(setKeyErrors, p.id, shapeError);
+      return;
+    }
+    patch(setLoadingModels, p.id, true);
+    patch(setBanners, p.id, null);
+    let impl;
+    try {
+      impl = await p.load();
+      const live = await impl.createClient(keys[p.id].trim()).listModels();
+      if (live.length === 0) {
+        patch(setBanners, p.id, { type: 'error', text: 'No compatible models were returned for this key.' });
+      } else {
+        patch(setModels, p.id, live);
+        if (!live.some((m) => m.id === selected[p.id])) handleModelChange(p.id, live[0].id);
+        patch(setBanners, p.id, { type: 'success', text: `Loaded ${live.length} models available to your key.` });
+      }
+    } catch (err) {
+      const friendly = impl ? impl.toFriendlyError(err) : { message: 'Could not load this provider. Check your connection.', fatal: true };
+      if (friendly.fatal) reportFatal(p.id, friendly.message);
+      else patch(setBanners, p.id, { type: 'error', text: friendly.message });
+    } finally {
+      patch(setLoadingModels, p.id, false);
+    }
+  }
+
+  /** Counts every sample with one provider. Errors here never affect the other providers. */
+  async function runProvider(p: ProviderMeta, list: TextSample[], run: AbortController): Promise<void> {
+    const markRemaining = (r: SampleResult) =>
+      setResults((prev) => {
+        const next = { ...prev };
+        for (const s of list) {
+          if (next[s.id]?.[p.id]?.status === 'loading') next[s.id] = { ...next[s.id], [p.id]: r };
+        }
+        return next;
+      });
+
+    let impl;
+    try {
+      impl = await p.load();
+    } catch {
+      markRemaining({ status: 'error', message: 'Skipped' });
+      reportFatal(p.id, `Could not load the ${p.name} SDK. Check your connection and retry.`);
+      return;
+    }
+
+    const client = impl.createClient(keys[p.id].trim());
+    const model = selected[p.id];
+    const ctrl = new AbortController(); // aborted on a fatal error for this provider, or on Cancel
+    const onCancel = () => ctrl.abort();
+    run.signal.addEventListener('abort', onCancel);
+
+    let fatal: string | null = null;
+    let failures = 0;
+    const queue = [...list];
+
+    const worker = async () => {
+      while (queue.length && !ctrl.signal.aborted) {
+        const sample = queue.shift()!;
+        try {
+          const tokens = await client.countTokens(model, sample.text, ctrl.signal);
+          setResult(sample.id, p.id, { status: 'success', tokens });
+        } catch (err) {
+          if (ctrl.signal.aborted) break;
+          const friendly = impl.toFriendlyError(err);
+          failures++;
+          setResult(sample.id, p.id, { status: 'error', message: friendly.message });
+          if (friendly.fatal && !fatal) {
+            fatal = friendly.message;
+            ctrl.abort(); // every remaining request for this provider would fail the same way
+          }
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY_PER_PROVIDER, list.length) }, worker));
+    run.signal.removeEventListener('abort', onCancel);
+    if (runRef.current !== run) return; // superseded by a newer run
+
+    markRemaining(fatal ? { status: 'error', message: 'Skipped' } : { status: 'idle' });
+    if (fatal) reportFatal(p.id, fatal);
+    else if (run.signal.aborted) return;
+    else if (failures > 0) {
+      patch(setBanners, p.id, { type: 'error', text: `${failures} of ${list.length} samples failed. See details below.` });
+    } else {
+      patch(setBanners, p.id, { type: 'success', text: `Counted ${list.length} samples with ${modelLabel(p.id)}.` });
+    }
+  }
+
+  async function handleCount() {
+    const active = PROVIDERS.filter((p) => keys[p.id].trim());
+    if (active.length === 0) {
+      setGlobalBanner({ type: 'error', text: 'Enter at least one API key (Anthropic, Gemini or OpenAI) to count tokens.' });
+      return;
+    }
+    const shapeErrors = perProvider((p) => (keys[p.id].trim() ? p.validateKeyShape(keys[p.id]) : null));
+    setKeyErrors(shapeErrors);
+    if (active.some((p) => shapeErrors[p.id])) return;
+
+    runRef.current?.abort();
+    const run = new AbortController();
+    runRef.current = run;
+
+    const list = samples;
+    setRunning(true);
+    setGlobalBanner(null);
+    setBanners(perProvider(() => null));
+    setResults(
+      Object.fromEntries(
+        list.map((s) => [s.id, Object.fromEntries(active.map((p) => [p.id, { status: 'loading' } as SampleResult]))]),
+      ),
+    );
+
+    await Promise.all(active.map((p) => runProvider(p, list, run)));
+
+    if (runRef.current !== run) return;
+    if (run.signal.aborted) setGlobalBanner({ type: 'error', text: 'Counting cancelled.' });
+    setRunning(false);
+    runRef.current = null;
   }
 
   function addCustomSample(e: React.FormEvent) {
@@ -68,122 +234,92 @@ export default function App() {
     setResults(({ [id]: _removed, ...rest }) => rest);
   }
 
-  async function handleCount() {
-    const shapeError = validateKeyShape(apiKey);
-    if (shapeError) {
-      setKeyError(shapeError);
-      return;
-    }
-
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    const client = createClient(apiKey.trim());
-    setRunning(true);
-    setBanner(null);
-    setResults(Object.fromEntries(samples.map((s) => [s.id, { status: 'loading' } as SampleResult])));
-
-    let fatal: string | null = null;
-    let failures = 0;
-    const queue = [...samples];
-
-    const worker = async () => {
-      while (queue.length && !controller.signal.aborted) {
-        const sample = queue.shift()!;
-        try {
-          const tokens = await countTokens(client, model, sample.text, controller.signal);
-          setResults((prev) => ({ ...prev, [sample.id]: { status: 'success', tokens } }));
-        } catch (err) {
-          if (controller.signal.aborted) break; // cancelled or stopped by a fatal error
-          const friendly = toFriendlyError(err);
-          failures++;
-          setResults((prev) => ({ ...prev, [sample.id]: { status: 'error', message: friendly.message } }));
-          if (friendly.fatal && !fatal) {
-            fatal = friendly.message;
-            controller.abort(); // stop the rest — every request would fail the same way
-          }
-        }
-      }
-    };
-
-    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, samples.length) }, worker));
-
-    if (abortRef.current !== controller) return; // superseded by a newer run
-
-    // Anything still "loading" was skipped because of a fatal error or a cancel.
-    setResults((prev) => {
-      const next = { ...prev };
-      for (const s of samples) {
-        if (next[s.id]?.status === 'loading') {
-          next[s.id] = fatal ? { status: 'error', message: 'Skipped' } : { status: 'idle' };
-        }
-      }
-      return next;
-    });
-
-    if (fatal) {
-      setBanner({ type: 'error', text: fatal });
-      if (/api key/i.test(fatal)) setKeyError(fatal);
-    } else if (controller.signal.aborted) {
-      setBanner({ type: 'error', text: 'Counting cancelled.' });
-    } else if (failures > 0) {
-      setBanner({ type: 'error', text: `${failures} of ${samples.length} samples failed. See details below.` });
-    } else {
-      setBanner({ type: 'success', text: `Counted ${samples.length} samples with ${labelFor(model)}.` });
-    }
-    setRunning(false);
-    abortRef.current = null;
-  }
-
-  function handleCancel() {
-    abortRef.current?.abort();
-  }
-
   return (
     <div className="page">
       <header className="header">
         <h1>Token Counter</h1>
         <p className="subtitle">
-          Count tokens for sample text with Anthropic’s official{' '}
-          <a href="https://docs.anthropic.com/en/docs/build-with-claude/token-counting" target="_blank" rel="noreferrer">
-            Token Counting API
-          </a>
-          .
+          Compare token counts across Anthropic Claude, Google Gemini and OpenAI using each provider’s official
+          token counting API. Add a key for any or all of them.
         </p>
       </header>
 
       <main className="layout">
         <section className="panel controls" aria-labelledby="settings-heading">
           <h2 id="settings-heading" className="panel-title">
-            Settings
+            Providers
           </h2>
 
-          <ApiKeyInput value={apiKey} onChange={handleKeyChange} error={keyError} disabled={running} />
+          {PROVIDERS.map((p) => {
+            const busy = running || loadingModels[p.id];
+            const banner = banners[p.id];
+            return (
+              <details key={p.id} className="provider" open>
+                <summary className="provider-summary">
+                  <span className={`dot dot-${p.id}`} aria-hidden="true" />
+                  <span className="provider-name">{p.name}</span>
+                  {keys[p.id].trim() ? (
+                    <span className="pill pill-on">Key added</span>
+                  ) : (
+                    <span className="pill">No key</span>
+                  )}
+                </summary>
 
-          <div className="field">
-            <label htmlFor="model" className="field-label">
-              Model
-            </label>
-            <select
-              id="model"
-              className="input"
-              value={model}
-              onChange={(e) => handleModelChange(e.target.value as ModelId)}
-              disabled={running}
-            >
-              {MODELS.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
-            <p className="field-hint">Token counts are model-specific.</p>
-          </div>
+                <div className="provider-body">
+                  <ApiKeyInput
+                    value={keys[p.id]}
+                    onChange={(v) => handleKeyChange(p.id, v)}
+                    error={keyErrors[p.id]}
+                    disabled={busy}
+                    label={p.keyLabel}
+                    placeholder={p.keyPlaceholder}
+                    apiHost={p.apiHost}
+                    consoleUrl={p.keyConsoleUrl}
+                    consoleName={p.keyConsoleName}
+                  />
+
+                  <div className="field">
+                    <label htmlFor={`model-${p.id}`} className="field-label">
+                      Model
+                    </label>
+                    <div className="key-row">
+                      <select
+                        id={`model-${p.id}`}
+                        className="input"
+                        value={selected[p.id]}
+                        onChange={(e) => handleModelChange(p.id, e.target.value)}
+                        disabled={busy}
+                      >
+                        {models[p.id].map((m) => (
+                          <option key={m.id} value={m.id}>
+                            {m.label}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        className="btn btn-ghost"
+                        onClick={() => handleLoadModels(p)}
+                        disabled={busy}
+                      >
+                        {loadingModels[p.id] ? 'Loading…' : 'Load models'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {banner && (
+                    <div className={`banner banner-${banner.type}`} role={banner.type === 'error' ? 'alert' : 'status'}>
+                      {banner.text}
+                    </div>
+                  )}
+                </div>
+              </details>
+            );
+          })}
 
           <div className="actions">
             {running ? (
-              <button type="button" className="btn btn-secondary" onClick={handleCancel}>
+              <button type="button" className="btn btn-secondary" onClick={() => runRef.current?.abort()}>
                 Cancel
               </button>
             ) : (
@@ -193,24 +329,41 @@ export default function App() {
             )}
           </div>
 
-          {banner && (
-            <div className={`banner banner-${banner.type}`} role={banner.type === 'error' ? 'alert' : 'status'}>
-              {banner.text}
+          {globalBanner && (
+            <div className={`banner banner-${globalBanner.type}`} role="alert">
+              {globalBanner.text}
             </div>
           )}
 
-          <div className="summary" aria-live="polite">
-            <div>
-              <span className="summary-value">{total.toLocaleString()}</span>
-              <span className="summary-label">total tokens</span>
-            </div>
-            <div>
-              <span className="summary-value">
-                {countedCount}/{samples.length}
-              </span>
-              <span className="summary-label">samples counted</span>
-            </div>
-          </div>
+          {shownProviders.length > 0 && (
+            <table className="summary-table" aria-live="polite">
+              <caption className="field-label">Totals</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Provider</th>
+                  <th scope="col">Tokens</th>
+                  <th scope="col">Counted</th>
+                </tr>
+              </thead>
+              <tbody>
+                {shownProviders.map((p) => (
+                  <tr key={p.id}>
+                    <th scope="row">
+                      <span className={`dot dot-${p.id}`} aria-hidden="true" />
+                      <span>
+                        {p.name}
+                        <span className="summary-model">{modelLabel(p.id)}</span>
+                      </span>
+                    </th>
+                    <td className="num">{totals[p.id].tokens.toLocaleString()}</td>
+                    <td className="num">
+                      {totals[p.id].counted}/{samples.length}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </section>
 
         <section className="panel" aria-labelledby="samples-heading">
@@ -219,14 +372,22 @@ export default function App() {
           </h2>
 
           <ul className="cards">
-            {samples.map((s) => (
-              <SampleCard
-                key={s.id}
-                sample={s}
-                result={results[s.id] ?? { status: 'idle' }}
-                onRemove={s.kind === 'Custom' && !running ? () => removeCustomSample(s.id) : undefined}
-              />
-            ))}
+            {samples.map((s) => {
+              const rows: ResultRow[] = shownProviders.map((p) => ({
+                providerId: p.id,
+                providerName: p.name,
+                modelLabel: modelLabel(p.id),
+                result: results[s.id]?.[p.id] ?? { status: 'idle' },
+              }));
+              return (
+                <SampleCard
+                  key={s.id}
+                  sample={s}
+                  rows={rows}
+                  onRemove={s.kind === 'Custom' && !running ? () => removeCustomSample(s.id) : undefined}
+                />
+              );
+            })}
           </ul>
 
           <form className="custom-form" onSubmit={addCustomSample}>
@@ -251,12 +412,9 @@ export default function App() {
       </main>
 
       <footer className="footer">
-        Your key is sent directly from your browser to <code>api.anthropic.com</code> and nowhere else.
+        Each key is sent directly from your browser to its own provider (<code>api.anthropic.com</code>,{' '}
+        <code>generativelanguage.googleapis.com</code>, <code>api.openai.com</code>) and nowhere else.
       </footer>
     </div>
   );
-}
-
-function labelFor(id: ModelId) {
-  return MODELS.find((m) => m.id === id)?.label ?? id;
 }

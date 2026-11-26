@@ -12,7 +12,7 @@ const CSP = [
   "script-src 'self'",
   "style-src 'self'",
   "img-src 'self' data:",
-  "connect-src https://api.anthropic.com",
+  "connect-src https://api.anthropic.com https://generativelanguage.googleapis.com https://api.openai.com",
   "base-uri 'none'",
   "form-action 'none'",
   "object-src 'none'",
@@ -29,7 +29,7 @@ function cspPlugin(): Plugin {
 
 // https://vite.dev/config/
 export default defineConfig({
-  // The Anthropic SDK is the bulk of the bundle (~150 kB gzipped); that's expected.
+  // Each provider SDK is lazy-loaded into its own chunk; the largest is ~150 kB gzipped.
   build: { chunkSizeWarningLimit: 800 },
   plugins: [react(), cspPlugin()],
 })
