@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ApiKeyInput } from './components/ApiKeyInput';
 import { SampleCard, type ResultRow, type SampleResult } from './components/SampleCard';
 import { PREDEFINED_SAMPLES, type TextSample } from './data/samples';
+import { keyStore } from './lib/keyStore';
 import { PROVIDERS } from './providers/registry';
 import type { ModelOption, ProviderId, ProviderMeta } from './providers/types';
 
@@ -18,11 +19,26 @@ function perProvider<T>(make: (p: ProviderMeta) => T): PerProvider<T> {
 }
 
 export default function App() {
-  // API keys live only in React state (memory). No storage, no logging.
-  const [keys, setKeys] = useState(() => perProvider(() => ''));
+  // API keys live in React state (memory). They are written to localStorage only
+  // if the user opts in with "Remember keys in this browser". Never logged.
+  const [remember, setRemember] = useState(keyStore.isRemembering);
+  const [keys, setKeys] = useState(() => {
+    const saved = keyStore.isRemembering() ? keyStore.loadKeys() : {};
+    return perProvider((p) => saved[p.id] ?? '');
+  });
   const [keyErrors, setKeyErrors] = useState(() => perProvider<string | null>(() => null));
-  const [models, setModels] = useState(() => perProvider<ModelOption[]>((p) => p.defaultModels));
-  const [selected, setSelected] = useState(() => perProvider((p) => p.defaultModels[0].id));
+  const [models, setModels] = useState(() => {
+    const saved = keyStore.loadModels();
+    // A previously loaded model that isn't in the defaults is kept selectable.
+    return perProvider<ModelOption[]>((p) => {
+      const id = saved[p.id];
+      return id && !p.defaultModels.some((m) => m.id === id) ? [{ id, label: id }, ...p.defaultModels] : p.defaultModels;
+    });
+  });
+  const [selected, setSelected] = useState(() => {
+    const saved = keyStore.loadModels();
+    return perProvider((p) => saved[p.id] ?? p.defaultModels[0].id);
+  });
   const [loadingModels, setLoadingModels] = useState(() => perProvider(() => false));
   const [banners, setBanners] = useState(() => perProvider<Banner>(() => null));
   const [globalBanner, setGlobalBanner] = useState<Banner>(null);
@@ -36,6 +52,28 @@ export default function App() {
 
   // Cancel in-flight requests if the component unmounts.
   useEffect(() => () => runRef.current?.abort(), []);
+
+  // Persist keys only while "Remember" is on; turning it off deletes them from storage.
+  useEffect(() => {
+    if (remember) keyStore.saveKeys(keys);
+    else keyStore.clearKeys();
+  }, [remember, keys]);
+
+  useEffect(() => keyStore.saveModels(selected), [selected]);
+
+  function handleRememberChange(on: boolean) {
+    setRemember(on);
+    keyStore.setRemembering(on);
+  }
+
+  function handleForgetKeys() {
+    keyStore.clearKeys();
+    handleRememberChange(false);
+    setKeys(perProvider(() => ''));
+    setKeyErrors(perProvider(() => null));
+  }
+
+  const hasAnyKey = PROVIDERS.some((p) => keys[p.id].trim());
 
   /** Providers shown in results: those with a key entered, or with results already on screen. */
   const shownProviders = PROVIDERS.filter(
@@ -250,6 +288,28 @@ export default function App() {
             Providers
           </h2>
 
+          <div className="remember">
+            <label className="remember-label">
+              <input
+                type="checkbox"
+                checked={remember}
+                onChange={(e) => handleRememberChange(e.target.checked)}
+                disabled={running}
+              />
+              Remember keys in this browser
+            </label>
+            {(remember || hasAnyKey) && (
+              <button type="button" className="link-btn" onClick={handleForgetKeys} disabled={running}>
+                Forget saved keys
+              </button>
+            )}
+            <p className="field-hint">
+              {remember
+                ? 'Keys are saved in this browser’s local storage so they survive reloads. Untick or click “Forget” to delete them. Avoid on shared computers.'
+                : 'Off: keys are kept in memory only and cleared when you reload.'}
+            </p>
+          </div>
+
           {PROVIDERS.map((p) => {
             const busy = running || loadingModels[p.id];
             const banner = banners[p.id];
@@ -276,6 +336,7 @@ export default function App() {
                     apiHost={p.apiHost}
                     consoleUrl={p.keyConsoleUrl}
                     consoleName={p.keyConsoleName}
+                    remembered={remember}
                   />
 
                   <div className="field">

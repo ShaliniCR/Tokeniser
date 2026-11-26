@@ -59,7 +59,7 @@ export function SampleCard({ sample, rows, onRemove }: Props) {
 function TokenBadge({ result }: { result: SampleResult }) {
   switch (result.status) {
     case 'idle':
-      return <span className="badge badge-idle">—</span>;
+      return <span className="badge badge-idle">Not counted yet</span>;
     case 'loading':
       return (
         <span className="badge badge-loading">

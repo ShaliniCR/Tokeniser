@@ -10,9 +10,10 @@ interface Props {
   apiHost: string;
   consoleUrl: string;
   consoleName: string;
+  remembered: boolean;
 }
 
-export function ApiKeyInput({ value, onChange, error, disabled, label, placeholder, apiHost, consoleUrl, consoleName }: Props) {
+export function ApiKeyInput({ value, onChange, error, disabled, label, placeholder, apiHost, consoleUrl, consoleName, remembered }: Props) {
   const [visible, setVisible] = useState(false);
   const id = useId();
   const hintId = `${id}-hint`;
@@ -72,7 +73,7 @@ export function ApiKeyInput({ value, onChange, error, disabled, label, placehold
         <a href={consoleUrl} target="_blank" rel="noreferrer">
           {consoleName}
         </a>
-        . Stays in this tab’s memory only and is sent only to <code>{apiHost}</code>.
+        . {remembered ? 'Saved in this browser' : 'Kept in memory only'} and sent only to <code>{apiHost}</code>.
       </p>
     </div>
   );

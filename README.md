@@ -14,6 +14,7 @@ A React + TypeScript app that counts tokens for a set of text samples using the 
 
 - **One UI, three providers.** Enter a key for any or all providers. A single **Count Tokens** button counts every sample with every provider that has a key, so each sample card shows the three counts side by side.
 - **Bring your own keys.** Each provider has its own masked key field with Show and Clear buttons.
+- **Optional "Remember keys".** Tick **Remember keys in this browser** to keep your keys after a reload. It is off by default, and **Forget saved keys** deletes them. Model choices are always remembered, since they aren't secret.
 - **Built-in samples.** Single words, sentences, a paragraph, code, multilingual text and emoji. You can also add samples of your own.
 - **Model picker per provider.** Starts with a list of current models. **Load models** fetches the exact models your key can use.
 - **Totals table.** Shows the total tokens and how many samples were counted for each provider and model.
@@ -69,6 +70,7 @@ src/
 ├── components/
 │   ├── ApiKeyInput.tsx        # Masked key field (show / clear)
 │   └── SampleCard.tsx         # One sample + a token badge per provider
+├── lib/keyStore.ts            # Opt-in localStorage persistence for keys + model choices
 ├── data/samples.ts            # Predefined text samples
 ├── providers/
 │   ├── types.ts               # Provider interface shared by the UI
@@ -105,12 +107,14 @@ Notes:
 | Expectation | How this app meets it |
 | --- | --- |
 | **Not hardcoded** | The code contains no keys and no `.env` file. Every user types in their own keys. |
-| **Not stored** | Keys exist only in React state, in memory. They are never written to `localStorage`, `sessionStorage`, cookies, IndexedDB or the URL. Reloading or closing the tab removes them, and each **Clear** button removes a key right away. |
+| **Not stored unless you choose to** | By default, keys exist only in React state, in memory, and reloading or closing the tab removes them. Only if you tick **Remember keys in this browser** are they saved to this browser's `localStorage`, on your device only, so they survive reloads. Unticking the box or clicking **Forget saved keys** deletes them right away, and each **Clear** button removes one key. Keys are never put in cookies, the URL, or anywhere a server can see them. |
 | **Not logged** | The app never logs keys or request headers, and its error messages don't include keys. |
 | **Each key goes only to its own provider** | The Anthropic key goes only to `api.anthropic.com`, the Gemini key only to `generativelanguage.googleapis.com` (in a header, not the URL), and the OpenAI key only to `api.openai.com`, all over HTTPS. There is no proxy or analytics. The production build includes a Content Security Policy whose `connect-src` lists only those three hosts, so the browser blocks requests anywhere else. |
 | **Not leaked by the browser** | Inputs have `autocomplete="off"`, spellcheck off, and password-manager opt-outs. The page sets `Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`. |
 
 **About `dangerouslyAllowBrowser`:** the Anthropic and OpenAI SDKs block browser use by default because a key shipped inside a frontend bundle can be read by anyone. Here no key is ever part of the bundle. Each user types in their own keys, and each key goes only to its own provider. That is the bring-your-own-key case this flag exists for. If an app uses **its own** keys on behalf of users, the keys must stay on a server, and the frontend should call a small backend proxy instead.
+
+**About "Remember keys":** `localStorage` isn't encrypted. Any script running on this page, or anyone using your browser profile, could read a saved key. That's why the option is off by default. The strict Content Security Policy only lets the page load its own scripts, which limits the first risk. Don't turn it on for a shared computer.
 
 **Tip:** for testing, create separate keys with low spend limits, and delete them afterwards.
 
